@@ -1,0 +1,542 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Acoustic modem</title>
+<style>
+*{box-sizing:border-box}html{color-scheme:light}body{margin:0;background:#edece6;color:#192922;font:16px/1.5 "Segoe UI",system-ui,sans-serif}main{width:min(1380px,92%);margin:auto;padding:clamp(20px,4vh,42px) 0}header,footer,.row{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}header{border-bottom:2px solid;padding-bottom:18px}h1,h2,p{margin:0}h1{font-size:clamp(34px,5vw,68px);font-weight:600;letter-spacing:-.075em;line-height:1}header small,.readout,label,.status,footer{font-family:ui-monospace,Consolas,monospace}.panels{display:grid;grid-template-columns:1fr 1fr}section{min-width:0;display:flex;flex-direction:column;gap:16px;padding:clamp(18px,3vw,42px) 0}section:first-child{padding-right:4vw}section+section{border-left:1px solid #babfb4;padding-left:4vw}h2{font-size:clamp(22px,2.5vw,34px);letter-spacing:-.05em;font-weight:550}.status{color:#46584b;font-size:.85rem}textarea{width:100%;height:clamp(130px,22vh,240px);resize:vertical;background:transparent;border:0;border-bottom:1px solid #a8b1a5;line-height:1.4;font-family:inherit;font-size:clamp(18px,2vw,27px);color:inherit;padding:8px 0}textarea:focus{outline:none;border-bottom-color:#264c35}button,select,.file,a.download{font:inherit;color:inherit;border:1px solid #939f93;padding:8px 14px;background:transparent;cursor:pointer;border-radius:2px}button.primary{background:#233d30;color:#f5f5e9;border-color:#233d30}button:disabled{opacity:.45;cursor:default}button:focus-visible,a:focus-visible,select:focus-visible,.file:focus-within{outline:2px solid #507841;outline-offset:3px}label{font-size:.86rem}.file{position:relative;overflow:hidden}.file input{position:absolute;inset:0;width:100%;opacity:0;cursor:pointer}.readout{margin-top:auto;padding:14px 18px;background:#23342b;color:#dcf1b7;font-size:.9rem;min-height:54px;overflow-wrap:anywhere}.hint{color:#4b594f;font-size:.9rem;min-height:1.6em;overflow-wrap:anywhere}footer{border-top:1px solid;padding-top:16px;font-size:.83rem}a{color:inherit}.download{align-self:flex-start}.actions{justify-content:flex-start}[hidden]{display:none!important}@media(max-width:720px){.panels{grid-template-columns:1fr}section:first-child,section+section{padding:20px 0;border-left:0}section+section{border-top:1px solid}textarea{height:125px}}
+.scope{display:grid;justify-items:end;gap:3px}.scope canvas{width:clamp(90px,18vw,240px);height:30px}.scope small{font-size:.72rem;letter-spacing:.12em}summary{cursor:pointer;color:#4b594f;width:fit-content}details select{margin:8px 0}textarea::placeholder{color:#687269}button.primary:hover{background:#345541}
+.readout.verified::before{content:"✓";display:inline-grid;place-items:center;width:1.35em;height:1.35em;margin-right:.65em;border:1px solid currentColor;border-radius:50%;vertical-align:middle}
+@media(prefers-reduced-motion:no-preference){.readout.verified::before{animation:confirm-in 280ms ease-out}@keyframes confirm-in{from{opacity:0;transform:scale(.82)}to{opacity:1;transform:scale(1)}}}
+</style><main>
+<header><h1>Acoustic modem</h1><div class="scope"><canvas id="scope" width="320" height="52" aria-label="Audio signal"></canvas></div></header>
+<div class="panels">
+<section><h2>Send</h2>
+<label for="message">Message</label><textarea id="message"></textarea>
+<div class="row"><label class="file">Choose file<input type="file" id="file" aria-label="Choose file"></label><button id="remove" hidden>Remove file</button><select id="mode" aria-label="Transfer mode"><option value="fast">Fast</option><option value="exact">Confirmed delivery</option></select></div>
+<details><summary>Frequency band</summary><select id="band" aria-label="Frequency band"><option value="wide">Wide · 3.4–9.9 kHz</option><option value="low">Low · 0.9–3.9 kHz</option><option value="high">High · 14.5–17.5 kHz</option></select></details>
+<p class="hint" id="hint"></p><div class="row actions"><button class="primary" id="send">Send</button><button id="stop" disabled>Stop</button></div><p class="readout" id="tx" role="status">Ready</p></section>
+<section><div class="row"><h2>Receive</h2><span class="status" id="mic">Microphone off</span></div><label for="output">Received text</label><textarea id="output" readonly></textarea>
+<div class="row actions"><button id="listen" class="primary">Listen</button><button id="clear">Clear</button><a id="download" class="download" hidden>Download file</a></div><p class="readout" id="rx" role="status">Idle</p></section>
+</div></main>
+<script>
+'use strict';
+// Fixed 48 kHz physical layer. One OFDM symbol carries eight protected bytes.
+const RATE=48000, CARRIERS=64;
+const CHIRP=512, LEAD=256, BYTES=152, CHUNK=128, SYMBOLS=BYTES/8;
+const MAX_FILE=32768, MAX_PARTS=Math.ceil((MAX_FILE+300)/CHUNK);
+const DATA=1, PARITY=2, END=3, ACK=4, SECOND_PARITY=5, REQUEST=6;
+const enc=new TextEncoder(), dec=new TextDecoder();
+function makeBand(n,first,chirpLow,sweep){
+  const prefix=n/4, step=n+prefix;
+  const chirp=new Float32Array(CHIRP), quadrature=new Float32Array(CHIRP);
+  for(let i=0;i<CHIRP;i++){
+    const phase=2*Math.PI*(chirpLow*i+sweep*i*i/(2*CHIRP))/RATE;
+    const envelope=Math.min(1,i/24,(CHIRP-1-i)/24);
+    chirp[i]=Math.cos(phase)*envelope;quadrature[i]=Math.sin(phase)*envelope;
+  }
+  return {n,first,prefix,step,chirp,quadrature,frame:CHIRP+LEAD+(1+SYMBOLS)*step+256};
+}
+const bands={
+  wide:makeBand(512,42,3400,5200),
+  low:makeBand(1024,20,950,2900),
+  high:makeBand(1024,310,14550,2900)
+};
+function fft(r,j,inverse=false){
+  const N=r.length;
+  for(let i=1,k=0;i<N;i++){
+    let bit=N>>1;
+    while(k&bit){k^=bit;bit>>=1} k^=bit;
+    if(i<k){[r[i],r[k]]=[r[k],r[i]];[j[i],j[k]]=[j[k],j[i]]}
+  }
+  for(let width=2;width<=N;width*=2){
+    const half=width/2, angle=(inverse?2:-2)*Math.PI/width;
+    const cr=Math.cos(angle),ci=Math.sin(angle);
+    for(let base=0;base<N;base+=width){
+      let wr=1,wi=0;
+      for(let k=base;k<base+half;k++){
+        const h=k+half, ar=r[h]*wr-j[h]*wi, ai=r[h]*wi+j[h]*wr;
+        r[h]=r[k]-ar;j[h]=j[k]-ai;r[k]+=ar;j[k]+=ai;
+        const next=wr*cr-wi*ci;wi=wi*cr+wr*ci;wr=next;
+      }
+    }
+  }
+}
+function codeword(n){
+  const a=n&1,b=n>>1&1,c=n>>2&1,d=n>>3;
+  const bits=[a^b^d,a^c^d,a,b^c^d,b,c,d,a^b^c];
+  return bits.reduce((word,bit,i)=>word|(bit<<i),0);
+}
+const codes=Array.from({length:16},(_,n)=>codeword(n));
+function crc(bytes){
+  let value=-1;
+  for(const byte of bytes){value^=byte;for(let i=0;i<8;i++)value=(value>>>1)^((value&1)?0xedb88320:0)}
+  return (value^-1)>>>0;
+}
+function packet(type,id,index,total,body,exact){
+  const p=new Uint8Array(BYTES),v=new DataView(p.buffer);
+  p[0]=0xa7;p[1]=type;p[2]=Number(exact);p[3]=body.length;p.set(id,4);
+  v.setUint16(12,index);v.setUint16(14,total);p.set(body,16);
+  v.setUint32(BYTES-4,crc(p.subarray(0,BYTES-4)));return p;
+}
+function parse(p){
+  const v=new DataView(p.buffer,p.byteOffset,p.byteLength);
+  if(p[0]!==0xa7||p[1]<DATA||p[1]>REQUEST||p[2]>1||p[3]>CHUNK||
+     v.getUint32(BYTES-4)!==crc(p.subarray(0,BYTES-4)))return null;
+  const total=v.getUint16(14),index=v.getUint16(12);
+  if(!total||total>MAX_PARTS||index>=total)return null;
+  return {type:p[1],exact:!!p[2],id:p.slice(4,12),index,total,body:p.slice(16,16+p[3])};
+}
+function modulate(bytes,band=bands.wide){
+  const {n:N,prefix:PREFIX,step:STEP,first:FIRST,frame:FRAME,chirp}=band;
+  const pcm=new Float32Array(FRAME);
+  for(let i=0;i<CHIRP;i++)pcm[i]=chirp[i]*.5;
+  const phases=Array.from({length:CARRIERS},(_,k)=>Math.PI*k*(k+1)/CARRIERS);
+  for(let s=-1;s<SYMBOLS;s++){
+    const r=new Float64Array(N),j=new Float64Array(N);
+    for(let k=0;k<CARRIERS;k++){
+      if(s>=0){
+        // Spread each Hamming word across widely separated carriers.
+        const word=k%16,other=(word+7)%16,bit=(k>>4)*2;
+        const xCode=codes[(bytes[s*8+(word>>1)]>>(word%2*4))&15];
+        const yCode=codes[(bytes[s*8+(other>>1)]>>(other%2*4))&15];
+        const x=(xCode>>bit)&1,y=(yCode>>(bit+1))&1;
+        phases[k]+=Math.atan2(y?-1:1,x?-1:1);
+      }
+      const bin=FIRST+k;
+      r[bin]=r[N-bin]=Math.cos(phases[k]);j[bin]=Math.sin(phases[k]);j[N-bin]=-j[bin];
+    }
+    fft(r,j,true);
+    const at=CHIRP+LEAD+(s+1)*STEP;
+    for(let i=0;i<STEP;i++)pcm[at+i]=r[(i+N-PREFIX)%N]*.023;
+  }
+  let peak=1;for(const x of pcm)peak=Math.max(peak,Math.abs(x)/.9);
+  if(peak>1)for(let i=0;i<pcm.length;i++)pcm[i]/=peak;
+  return pcm;
+}
+function demodulate(samples,start,band){
+  const {n:N,prefix:PREFIX,step:STEP,first:FIRST}=band;
+  let prevR,prevI,referencePower;
+  const bytes=new Uint8Array(BYTES);
+  for(let s=-1;s<SYMBOLS;s++){
+    const at=start+CHIRP+LEAD+(s+1)*STEP+PREFIX-24;
+    const r=Float64Array.from(samples.subarray(at,at+N)),j=new Float64Array(N);
+    fft(r,j);
+    if(s<0){
+      const powers=Array.from({length:CARRIERS},(_,k)=>r[FIRST+k]**2+j[FIRST+k]**2);
+      powers.sort((a,b)=>a-b);
+      referencePower=Math.max(1e-15,powers[CARRIERS>>1]);
+    }else{
+      const scores=new Float64Array(128);
+      for(let k=0;k<CARRIERS;k++){
+        const b=FIRST+k, word=k%16, bit=(k>>4)*2;
+        const x=r[b]*prevR[b]+j[b]*prevI[b];
+        const y=j[b]*prevR[b]-r[b]*prevI[b];
+        // A narrowband interferer can be much stronger than an OFDM carrier.
+        // Bound its vote and attenuate persistent spectral peaks.
+        const ratio=Math.hypot(x,y)/referencePower;
+        const weight=1/Math.max(1,ratio*ratio);
+        scores[word*8+bit]=x*weight;
+        scores[((word+7)%16)*8+bit+1]=y*weight;
+      }
+      for(let w=0;w<16;w++){
+        let best=0,max=-Infinity;
+        for(let nib=0;nib<16;nib++){
+          let score=0;
+          for(let bit=0;bit<8;bit++)score+=scores[w*8+bit]*((codes[nib]>>bit)&1?-1:1);
+          if(score>max){max=score;best=nib}
+        }
+        bytes[s*8+(w>>1)]|=best<<(w%2*4);
+      }
+    }
+    prevR=r;prevI=j;
+  }
+  return parse(bytes);
+}
+const bandList=Object.values(bands);
+class Decoder{
+  constructor(onPacket){this.buffer=new Float32Array(0);this.onPacket=onPacket;this.lock=false}
+  feed(chunk){
+    const buf=new Float32Array(this.buffer.length+chunk.length);
+    buf.set(this.buffer);buf.set(chunk,this.buffer.length);
+    let pos=0;
+    while(pos+CHIRP<=buf.length){
+      if(!this.lock){
+        for(const band of bandList){
+          let a=0,b=0,power=0;
+          for(let i=0;i<CHIRP;i+=4){
+            const x=buf[pos+i];power+=x*x;a+=x*band.chirp[i];b+=x*band.quadrature[i];
+          }
+          if(power>1e-6&&a*a+b*b>power*CHIRP*.045){this.lock=band;break}
+        }
+        if(!this.lock){pos+=4;continue}
+      }
+      const band=this.lock;
+      if(pos+band.frame-128>buf.length)break;
+      const p=demodulate(buf,pos,band);
+      this.lock=false;
+      if(p){p.band=band;this.onPacket(p);pos+=band.frame-128}else pos+=32;
+    }
+    this.buffer=buf.slice(pos);
+  }
+}
+
+const same=(a,b)=>a.length===b.length&&a.every((x,i)=>x===b[i]);
+const key=id=>Array.from(id,x=>x.toString(16).padStart(2,'0')).join('');
+// WebCrypto digest is unavailable on plain LAN HTTP. Use the same SHA-256
+// format there so a phone can transmit to a secure-context receiver.
+const roundConstants=Uint32Array.of(
+  0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+  0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+  0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+  0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+  0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+  0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+  0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2);
+function portableHash(bytes){
+  const state=Uint32Array.of(0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19);
+  const padded=new Uint8Array(Math.ceil((bytes.length+9)/64)*64),view=new DataView(padded.buffer);
+  padded.set(bytes);padded[bytes.length]=128;view.setUint32(padded.length-4,bytes.length*8);
+  const words=new Uint32Array(64),ror=(x,n)=>(x>>>n)|(x<<(32-n));
+  for(let off=0;off<padded.length;off+=64){
+    for(let i=0;i<16;i++)words[i]=view.getUint32(off+i*4);
+    for(let i=16;i<64;i++){
+      const x=words[i-15],y=words[i-2];
+      words[i]=words[i-16]+(ror(x,7)^ror(x,18)^(x>>>3))+words[i-7]+(ror(y,17)^ror(y,19)^(y>>>10));
+    }
+    let [a,b,c,d,e,f,g,h]=state;
+    for(let i=0;i<64;i++){
+      const t=h+(ror(e,6)^ror(e,11)^ror(e,25))+((e&f)^(~e&g))+roundConstants[i]+words[i];
+      const u=(ror(a,2)^ror(a,13)^ror(a,22))+((a&b)^(a&c)^(b&c));
+      h=g;g=f;f=e;e=(d+t)>>>0;d=c;c=b;b=a;a=(t+u)>>>0;
+    }
+    [a,b,c,d,e,f,g,h].forEach((v,i)=>state[i]+=v);
+  }
+  const result=new Uint8Array(32),out=new DataView(result.buffer);
+  state.forEach((v,i)=>out.setUint32(i*4,v));return result;
+}
+async function hash(bytes){
+  return crypto.subtle?new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)):portableHash(bytes);
+}
+async function envelope(bytes,name,file){
+  const label=enc.encode(name);
+  if(label.length>255||bytes.length>MAX_FILE)throw Error('Use a file up to 32 KiB and a name up to 255 UTF-8 bytes.');
+  const raw=new Uint8Array(6+label.length+bytes.length);
+  raw[0]=Number(file);raw[1]=label.length;new DataView(raw.buffer).setUint32(2,bytes.length);
+  raw.set(label,6);raw.set(bytes,6+label.length);
+  const digest=await hash(raw),wire=new Uint8Array(32+raw.length);
+  wire.set(digest);wire.set(raw,32);return {digest,wire};
+}
+// Two independent parity equations over GF(256), polynomial x^8+x^4+x^3+x^2+1.
+const exp=new Uint8Array(510),log=new Uint8Array(256);
+for(let i=0,x=1;i<255;i++){
+  exp[i]=exp[i+255]=x;log[x]=i;x<<=1;if(x&256)x^=0x11d;
+}
+function multiply(x,y){return x&&y?exp[log[x]+log[y]]:0}
+function frames(wire,id,exact){
+  const total=Math.ceil(wire.length/CHUNK),list=[];
+  for(let start=0;start<total;start+=4){
+    const parity=new Uint8Array(CHUNK),weighted=new Uint8Array(CHUNK);
+    for(let i=start;i<Math.min(total,start+4);i++){
+      const body=wire.subarray(i*CHUNK,(i+1)*CHUNK);
+      body.forEach((b,j)=>{parity[j]^=b;weighted[j]^=multiply(i-start+1,b)});
+      list.push(packet(DATA,id,i,total,body,exact));
+    }
+    list.push(packet(PARITY,id,start,total,parity,exact));
+    if(exact)list.push(packet(SECOND_PARITY,id,start,total,weighted,true));
+  }
+  list.push(packet(END,id,0,total,new Uint8Array(),exact));return list;
+}
+class Assembly{
+  constructor(p){this.total=p.total;this.exact=p.exact;this.parts=new Map();this.parity=new Map();this.weighted=new Map()}
+  add(p){
+    if(p.total!==this.total||p.exact!==this.exact)return;
+    if(p.type===DATA)this.parts.set(p.index,p.body);
+    if(p.type===PARITY&&p.index%4===0&&p.body.length===CHUNK)this.parity.set(p.index,p.body);
+    if(p.type===SECOND_PARITY&&p.index%4===0&&p.body.length===CHUNK)this.weighted.set(p.index,p.body);
+    const start=p.index-p.index%4, parity=this.parity.get(start),weighted=this.weighted.get(start);
+    if(!parity&&!weighted)return;
+    const missing=[];
+    for(let i=start;i<Math.min(start+4,this.total);i++)if(!this.parts.has(i))missing.push(i);
+    if(!missing.length||missing.length>Number(!!parity)+Number(!!weighted))return;
+    const sum=parity?.slice(),weightedSum=weighted?.slice();
+    for(let i=start;i<Math.min(start+4,this.total);i++)this.parts.get(i)?.forEach((b,j)=>{
+      if(sum)sum[j]^=b;if(weightedSum)weightedSum[j]^=multiply(i-start+1,b);
+    });
+    const a=missing[0]-start+1;
+    if(missing.length===1){
+      this.parts.set(missing[0],sum||weightedSum.map(v=>multiply(v,exp[255-log[a]])));
+    }else{
+      const b=missing[1]-start+1,inv=exp[255-log[a^b]];
+      const first=weightedSum.map((v,j)=>multiply(v^multiply(b,sum[j]),inv));
+      this.parts.set(missing[0],first);this.parts.set(missing[1],sum.map((v,j)=>v^first[j]));
+    }
+  }
+  async verify(){
+    if(this.parts.size!==this.total)return null;
+    const wire=new Uint8Array(this.total*CHUNK);
+    for(const [index,part] of this.parts)wire.set(part,index*CHUNK);
+    const size=new DataView(wire.buffer).getUint32(34),nameLength=wire[33],end=38+nameLength+size;
+    if(wire[32]>1||size>MAX_FILE||end>wire.length||Math.ceil(end/CHUNK)!==this.total)return null;
+    const digest=await hash(wire.subarray(32,end));
+    if(!same(digest,wire.subarray(0,32)))return null;
+    return {digest,file:!!wire[32],name:dec.decode(wire.subarray(38,38+nameLength)),bytes:wire.slice(38+nameLength,end)};
+  }
+}
+const $=id=>document.getElementById(id);
+let ctx, capture, job, reply, downloadURL;
+const incoming=new Map(),own=new Set();
+const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+let lastDraw=0;
+function drawSignal(samples){
+  if(performance.now()-lastDraw<80)return;
+  lastDraw=performance.now();
+  const canvas=$('scope'),g=canvas.getContext('2d');
+  if(!g)return;
+  const w=canvas.width,h=canvas.height;
+  g.clearRect(0,0,w,h);g.strokeStyle='#355740';g.beginPath();
+  for(let x=0;x<w;x+=2){
+    let peak=0;
+    const at=Math.floor(x*samples.length/w);
+    for(let i=at;i<Math.min(samples.length,at+12);i++)peak=Math.max(peak,Math.abs(samples[i]));
+    const dy=Math.max(.5,Math.min(.48,Math.sqrt(peak)*.55)*h);
+    g.moveTo(x,h/2-dy);g.lineTo(x,h/2+dy);
+  }
+  g.stroke();
+}
+async function audio(){
+  ctx??=new AudioContext({sampleRate:RATE});
+  if(ctx.sampleRate!==RATE)throw Error('48 kHz audio is unavailable.');
+  if(ctx.state!=='running')await ctx.resume();
+  return ctx;
+}
+async function play(packets,owner){
+  const ac=await audio();
+  if(owner.cancelled)return;
+  // Queue short runs ahead of the audio clock; memory does not scale with file duration.
+  for(let i=0;i<packets.length&&!owner.cancelled;i+=4){
+    const batch=packets.slice(i,i+4);
+    const buffer=ac.createBuffer(1,owner.band.frame*batch.length,RATE);
+    batch.forEach((p,j)=>{
+      const pcm=modulate(p,owner.band);buffer.copyToChannel(pcm,0,j*owner.band.frame);
+      if(j===0)drawSignal(pcm);
+    });
+    await new Promise(resolve=>{
+      const source=ac.createBufferSource();source.buffer=buffer;source.connect(ac.destination);
+      owner.source=source;source.onended=()=>{source.disconnect();resolve()};source.start();
+    });
+  }
+}
+async function handle(p,session){
+  const id=key(p.id);
+  if(p.type===ACK){
+    if(job&&job.key===id&&job.exact&&same(job.digest,p.body))job.confirmed=true;
+    return;
+  }
+  if(p.type===REQUEST){
+    if(job?.exact&&job.key===id&&p.body.length===Math.ceil(p.total/8))job.request=p.body;
+    return;
+  }
+  const local=own.has(id);
+  if(!incoming.has(id)){
+    if(incoming.size>=8)incoming.delete(incoming.keys().next().value);
+    incoming.set(id,new Assembly(p));
+  }
+  const a=incoming.get(id);
+  if(a.total!==p.total||a.exact!==p.exact)return;
+  a.add(p);
+  if(p.type===END)a.ended=true;
+  if(!a.result&&!a.checking){
+    $('rx').classList.remove('verified');
+    $('rx').textContent='Receiving · '+a.parts.size+' / '+a.total+' packets';
+    if(a.parts.size===a.total){
+      a.checking=true;
+      try{a.result=await a.verify()}finally{a.checking=false}
+      if(capture!==session)return;
+      if(!a.result){$('rx').textContent='File verification failed';a.parts.clear();a.parity.clear();a.weighted.clear();return}
+      const result=a.result;
+      if(downloadURL)URL.revokeObjectURL(downloadURL);
+      $('download').hidden=!result.file;
+      $('output').value=result.file?'':dec.decode(result.bytes);
+      if(result.file){
+        downloadURL=URL.createObjectURL(new Blob([result.bytes]));
+        $('download').href=downloadURL;$('download').download=result.name;
+        $('download').textContent=result.name+' · Download';
+      }
+      $('rx').textContent=result.bytes.length+' bytes · Verified';
+      $('rx').classList.add('verified');
+    }
+  }
+  if(!local&&p.exact&&a.ended&&!a.checking&&!reply&&!job){
+    a.ended=false;
+    const owner={band:p.band};reply=owner;
+    try{
+      await wait(180);
+      if(capture===session&&!owner.cancelled){
+        const missing=new Uint8Array(Math.ceil(a.total/8));
+        for(let i=0;i<a.total;i++)if(!a.parts.has(i))missing[i>>3]|=1<<(i%8);
+        const response=a.result?packet(ACK,p.id,0,p.total,a.result.digest,true):packet(REQUEST,p.id,0,p.total,missing,true);
+        await play([response],owner);
+      }
+    }finally{if(reply===owner)reply=null}
+  }
+}
+let captureModule;
+    const workletCode = `
+      class ToneCapture extends AudioWorkletProcessor {
+        constructor() {
+          super();
+          this.batch = new Float32Array(2048);
+          this.index = 0;
+        }
+        process(inputs) {
+          const channel = inputs[0]?.[0];
+          if (!channel) return true;
+          for (const sample of channel) {
+            this.batch[this.index++] = sample;
+            if (this.index === this.batch.length) {
+              this.port.postMessage(this.batch, [this.batch.buffer]);
+              this.batch = new Float32Array(2048);
+              this.index = 0;
+            }
+          }
+          return true;
+        }
+      }
+      registerProcessor('tone-capture', ToneCapture);
+    `;
+
+    function loadCaptureModule(audio) {
+      if (!captureModule) {
+        const url = URL.createObjectURL(new Blob([workletCode], { type: 'text/javascript' }));
+        captureModule = audio.audioWorklet.addModule(url)
+          .finally(() => URL.revokeObjectURL(url))
+          .catch(error => { captureModule = null; throw error; });
+      }
+      return captureModule;
+    }
+
+    async function createCaptureNode(audio, feed) {
+      // Local files have an opaque origin in some browsers, which blocks
+      // the blob URL used by the inline worklet.
+      if (location.protocol !== 'file:' && audio.audioWorklet && typeof AudioWorkletNode === 'function') {
+        try {
+          await loadCaptureModule(audio);
+          const node = new AudioWorkletNode(audio, 'tone-capture');
+          node.port.onmessage = event => feed(event.data);
+          return { node, close: () => {
+            node.port.onmessage = null;
+            node.port.close();
+          } };
+        } catch (error) {
+          if (typeof audio.createScriptProcessor !== 'function') throw error;
+        }
+      }
+      if (typeof audio.createScriptProcessor !== 'function') {
+        throw new Error('Open this page over HTTPS or localhost to use the microphone.');
+      }
+      const node = audio.createScriptProcessor(1024, 1, 1);
+      node.onaudioprocess = event => feed(event.inputBuffer.getChannelData(0));
+      return { node, close: () => { node.onaudioprocess = null; } };
+    }
+
+function closeMic(){
+  const c=capture;capture=null;
+  if(reply){reply.cancelled=true;reply.source?.stop()}
+  c?.stream?.getTracks().forEach(t=>t.stop());
+  for(const n of c?.nodes||[])n.disconnect();
+  c?.closeInput?.();
+  $('listen').textContent='Listen';$('mic').textContent='Microphone off';
+}
+async function microphone(){
+  if(capture)return capture.ready;
+  const c={nodes:[]};capture=c;
+  c.ready=(async()=>{
+    try{
+      const ac=await audio();
+      if(!navigator.mediaDevices?.getUserMedia)throw Error('Microphone access requires HTTPS, localhost or a local file.');
+      const stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+      if(capture!==c){stream.getTracks().forEach(t=>t.stop());throw Error('Listening stopped.')}
+      c.stream=stream;
+      const decoder=new Decoder(p=>handle(p,c).catch(e=>{$('rx').textContent=e.message}));
+      const input=await createCaptureNode(ac,samples=>{
+        decoder.feed(samples);
+        if(!job)drawSignal(samples);
+      });
+      if(capture!==c){input.close();throw Error('Listening stopped.')}
+      c.closeInput=input.close;
+      const src=ac.createMediaStreamSource(stream),proc=input.node,mute=ac.createGain();
+      mute.gain.value=0;c.nodes=[src,proc,mute];
+      src.connect(proc).connect(mute).connect(ac.destination);
+      stream.getAudioTracks()[0].onended=()=>{if(capture===c)closeMic()};
+      $('mic').textContent='Microphone on';$('listen').textContent='Stop listening';
+    }catch(e){if(capture===c)closeMic();throw e}
+  })();return c.ready;
+}
+function hint(){
+  const file=$('file').files[0],bytes=file?.size??enc.encode($('message').value).length;
+  $('remove').hidden=!file;$('message').disabled=!!file||!!job;
+  if(!file&&!bytes){$('hint').textContent='File limit: 32 KiB';return}
+  const n=Math.ceil((38+enc.encode(file?.name||'').length+bytes)/CHUNK);
+  const parityCount=$('mode').value==='exact'?2:1;
+  const seconds=(n+parityCount*Math.ceil(n/4)+1)*bands[$('band').value].frame/RATE;
+  $('hint').textContent=(file?file.name+' · ':'')+bytes+' bytes · '+seconds.toFixed(1)+' s per pass';
+}
+$('file').onchange=$('message').oninput=$('mode').onchange=$('band').onchange=hint;
+$('remove').onclick=()=>{$('file').value='';hint()};
+$('listen').onclick=async()=>{try{if(capture)closeMic();else await microphone()}catch(e){$('rx').classList.remove('verified');$('rx').textContent=e.message}};
+$('clear').onclick=()=>{
+  $('output').value='';
+  if(downloadURL)URL.revokeObjectURL(downloadURL);
+  downloadURL=null;
+  const link=$('download');
+  link.hidden=true;link.removeAttribute('href');link.removeAttribute('download');
+  link.textContent='Download file';
+  $('rx').classList.remove('verified');
+  $('rx').textContent=capture?'Listening':'Idle';
+};
+$('stop').onclick=()=>{if(job){job.cancelled=true;job.source?.stop();$('tx').textContent='Stopped'}};
+$('send').onclick=async()=>{
+  if(job||reply)return;
+  $('tx').classList.remove('verified');
+  const owner={band:bands[$('band').value],exact:$('mode').value==='exact'};job=owner;
+  for(const id of ['file','remove','mode','band','send','listen'])$(id).disabled=true;
+  $('stop').disabled=false;hint();
+  let opened=false;
+  try{
+    const file=$('file').files[0];
+    if(file?.size>MAX_FILE)throw Error('Choose a file up to 32 KiB.');
+    if(!file&&!$('message').value)throw Error('Enter a message or choose a file.');
+    await audio();
+    const bytes=file?new Uint8Array(await file.arrayBuffer()):enc.encode($('message').value);
+    const {wire,digest}=await envelope(bytes,file?.name||'',!!file);
+    const id=crypto.getRandomValues(new Uint8Array(8));
+    owner.key=key(id);owner.digest=digest;own.add(owner.key);
+    if(own.size>32)own.delete(own.values().next().value);
+    if(owner.exact&&!owner.cancelled){opened=!capture;await microphone()}
+    const packets=frames(wire,id,owner.exact);
+    for(let attempt=1;attempt<=(owner.exact?3:1)&&!owner.cancelled;attempt++){
+      $('tx').textContent='Sending · attempt '+attempt;
+      const missing=owner.request;owner.request=null;
+      const batch=missing?packets.filter(p=>{
+        const index=p[12]*256+p[13];
+        return p[1]===END||(p[1]===DATA&&(missing[index>>3]&(1<<(index%8))));
+      }):packets;
+      await play(batch,owner);
+      if(owner.cancelled)break;
+      if(!owner.exact){$('tx').textContent='Sent · '+bytes.length+' bytes';break}
+      $('tx').textContent='Waiting for confirmation';
+      const deadline=Date.now()+1800;
+      while(!owner.confirmed&&!owner.request&&!owner.cancelled&&Date.now()<deadline)await wait(30);
+      if(owner.confirmed){
+        $('tx').textContent='Delivery confirmed · '+bytes.length+' bytes';
+        $('tx').classList.add('verified');
+        break;
+      }
+      if(attempt===3)$('tx').textContent='Delivery unconfirmed';
+    }
+  }catch(e){$('tx').textContent=e.message}finally{
+    if(opened)closeMic();job=null;
+    for(const id of ['file','remove','mode','band','send','listen'])$(id).disabled=false;
+    $('stop').disabled=true;hint();
+  }
+};hint();
+</script></html>
