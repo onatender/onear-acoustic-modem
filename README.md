@@ -36,13 +36,13 @@ These are selectable frequency ranges, not a measured ranking of range, comfort,
 
 ## Performance
 
-The current project has not yet been measured as a byte-verified transfer between physical devices. The app's displayed duration estimates audio time from packet count and selected profile. End-to-end time in Confirmed delivery also includes microphone startup, receiver processing, acknowledgements, and any retransmissions.
+The app currently estimates a transfer at roughly **150 bytes/s** in the wide-band profile. For example, a 14,437-byte file is shown as about 96 seconds per pass. This is a calculated audio-time estimate from packet count, parity overhead, and symbol duration, not a byte-verified measurement between physical devices. Real end-to-end throughput depends on the selected profile, device audio hardware, missed packets, microphone startup, receiver processing, acknowledgements, and retransmissions.
 
 Published figures from other projects provide context, not a direct benchmark:
 
 | Project | Published result | Conditions |
 | --- | ---: | --- |
-| Onear Acoustic Modem | Not measured over the air | Browser implementation; physical device throughput remains to be measured |
+| Onear Acoustic Modem | About 150 bytes/s estimated | Wide-band audio-time estimate shown by the app; not measured over the air |
 | [ggwave](https://github.com/ggerganov/ggwave) | 8–16 bytes/s | Library estimate, depending on protocol parameters |
 | [Quiet.js](https://github.com/quiet/quiet-js) | About 7 kbit/s audible; about 64 kbit/s over cable | Project profile figures; cable mode is not speaker-to-microphone transmission |
 | [Cyrinx](https://github.com/dweekly/cyrinx) | 65.875 kbit/s scheduled goodput, Mac to Pixel | Specific MacBook Pro and Pixel 7a setup; 4,215 of 4,280 blocks verified. The report notes evidence and verifier limitations |
